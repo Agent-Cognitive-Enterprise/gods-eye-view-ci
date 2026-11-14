@@ -330,3 +330,234 @@ test('an NWS Cancel message cancels what it references and is no warning itself'
   assert.equal(svc.detail('nws:A').status, 'cancelled');
   assert.equal(svc.detail('nws:B'), null);
 });
+
+// --- shared outlines on disk and in memory --------------------------------
+// A zone-like polygon: a closed ring of `n` positions around (lon, lat).
+const zonePolygon = (lon, lat, n = 400) => {
+  const ring = [];
+  for (let i = 0; i < n; i++) {
+    const a = (2 * Math.PI * i) / n;
+    ring.push([
+      +(lon + 0.5 * Math.cos(a)).toFixed(6),
+      +(lat + 0.3 * Math.sin(a)).toFixed(6),
+    ]);
+  }
+  ring.push([...ring[0]]);
+  return [ring];
+};
+const zoneDraft = (id, polygons, extra = {}) => ({
+  id,
+  sourceId: 'nws-marine',
+  domain: 'marine_weather',
+  title: `Small Craft Advisory ${id}`,
+  effectiveFromUtc: new Date(T - 3600_000).toISOString(),
+  effectiveUntilUtc: new Date(T + 6 * 3600_000).toISOString(),
+  geometry: { type: 'MultiPolygon', coordinates: polygons },
+  geometryPrecision: 'official',
+  ...extra,
+});
+const readSaved = (dir) =>
+  JSON.parse(fs.readFileSync(path.join(dir, 'warnings.json'), 'utf8'));
+const byId = (list) => Object.fromEntries(list.map((w) => [w.id, w]));
+
+test('warnings that share zones keep each outline once, on disk and in memory', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
+  const a = zonePolygon(-159.5, 22.4);
+  const b = zonePolygon(-158.2, 21.6);
+  const c = zonePolygon(-156.9, 20.9);
+  // Three updates over the same two zones (as NWS issues them), and one
+  // more that shares one zone and adds another.
+  svc.apply(
+    'nws-marine',
+    [
+      zoneDraft('nws:1', [a, b]),
+      zoneDraft('nws:2', structuredClone([a, b])),
+      zoneDraft('nws:3', structuredClone([a, b])),
+      zoneDraft('nws:4', structuredClone([b, c])),
+    ],
+    { complete: true, parserVersion: 't' },
+  );
+  const before = svc.list();
+  svc.stop();
+
+  const saved = readSaved(dir);
+  assert.equal(saved.version, 2);
+  assert.equal(Object.keys(saved.parts).length, 3, 'one copy per zone');
+  const fileBytes = fs.statSync(path.join(dir, 'warnings.json')).size;
+  const inlineBytes = JSON.stringify(before.map((w) => w.geometry)).length;
+  assert.ok(
+    fileBytes < inlineBytes / 2,
+    `shared form ${fileBytes} B vs ${inlineBytes} B of inline outlines`,
+  );
+
+  const again = createWarningService({ dir, now: () => T, log: () => {} });
+  const after = again.list();
+  assert.deepEqual(byId(after), byId(before), 'the same warnings come back');
+  const w = byId(after);
+  assert.equal(
+    w['nws:1'].geometry.coordinates[0],
+    w['nws:2'].geometry.coordinates[0],
+    'one array in memory, not a copy per warning',
+  );
+  assert.equal(
+    w['nws:1'].geometry.coordinates[1],
+    w['nws:4'].geometry.coordinates[0],
+  );
+  // Shared parts cannot be changed through one warning.
+  assert.throws(
+    () => w['nws:1'].geometry.coordinates[0][0].push([0, 0]),
+    TypeError,
+  );
+  assert.throws(() => {
+    w['nws:1'].geometry.coordinates[0][0][0][0] = 0;
+  }, TypeError);
+  assert.equal(again.detail('nws:4').geometry.coordinates.length, 2);
+});
+
+test('an older file with every outline inline loads and is rewritten in the shared form', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
+  const a = zonePolygon(-70.5, 48.4);
+  svc.apply(
+    'nws-marine',
+    [
+      zoneDraft('nws:1', [a]),
+      zoneDraft('nws:2', structuredClone([a])),
+      {
+        ...zoneDraft('nws:3', []),
+        geometry: { type: 'Point', coordinates: [-160, 64] },
+      },
+    ],
+    { complete: true, parserVersion: 't' },
+  );
+  const before = svc.list();
+  svc.stop();
+  // Turn the saved file back into version 1: inline outlines, no parts.
+  const v2 = readSaved(dir);
+  const inline = (g) =>
+    g?.refs
+      ? { type: g.type, coordinates: g.refs.map((r) => v2.parts[r]) }
+      : g?.ref
+        ? { type: g.type, coordinates: v2.parts[g.ref] }
+        : g;
+  fs.writeFileSync(
+    path.join(dir, 'warnings.json'),
+    JSON.stringify({
+      version: 1,
+      records: v2.records.map((r) => ({ ...r, geometry: inline(r.geometry) })),
+      sources: v2.sources,
+    }),
+  );
+
+  const old = createWarningService({ dir, now: () => T, log: () => {} });
+  assert.deepEqual(byId(old.list()), byId(before));
+  const w = byId(old.list());
+  assert.equal(
+    w['nws:1'].geometry.coordinates[0],
+    w['nws:2'].geometry.coordinates[0],
+  );
+  old.stop(); // nothing new arrived, but the older form is rewritten
+  const rewritten = readSaved(dir);
+  assert.equal(rewritten.version, 2);
+  assert.equal(Object.keys(rewritten.parts).length, 1);
+  assert.deepEqual(rewritten.records.find((r) => r.id === 'nws:3').geometry, {
+    type: 'Point',
+    coordinates: [-160, 64],
+  });
+  const third = createWarningService({ dir, now: () => T, log: () => {} });
+  assert.deepEqual(byId(third.list()), byId(before));
+});
+
+test('outlines of pruned warnings leave the file with them', () => {
+  const dir = tmp();
+  let clock = T;
+  const svc = createWarningService({ dir, now: () => clock, log: () => {} });
+  const kept = zonePolygon(-150, 60);
+  const gone = zonePolygon(-140, 58);
+  const opts = { complete: true, parserVersion: 't' };
+  svc.apply(
+    'nws-marine',
+    [zoneDraft('nws:kept', [kept]), zoneDraft('nws:gone', [gone])],
+    opts,
+  );
+  svc.stop();
+  assert.equal(Object.keys(readSaved(dir).parts).length, 2);
+  // Left out of two complete listings: ended; 31 days on: pruned.
+  svc.apply('nws-marine', [zoneDraft('nws:kept', [kept])], opts);
+  svc.apply('nws-marine', [zoneDraft('nws:kept', [kept])], opts);
+  assert.equal(svc.detail('nws:gone').endReason, 'removed_by_source');
+  clock += 31 * 24 * 3600_000;
+  svc.apply(
+    'nws-marine',
+    [
+      zoneDraft('nws:kept', [kept], {
+        effectiveUntilUtc: new Date(clock + 3600_000).toISOString(),
+      }),
+    ],
+    opts,
+  );
+  assert.equal(svc.detail('nws:gone'), null, 'pruned');
+  svc.stop();
+  const saved = readSaved(dir);
+  assert.equal(Object.keys(saved.parts).length, 1);
+  assert.deepEqual(
+    saved.records.map((r) => r.id),
+    ['nws:kept'],
+  );
+});
+
+test('a save that fails leaves the last good file and is tried again', () => {
+  const dir = tmp();
+  const logs = [];
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: (m) => logs.push(m),
+  });
+  const opts = { complete: true, parserVersion: 't' };
+  svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], opts);
+  svc.stop();
+  const good = fs.readFileSync(path.join(dir, 'warnings.json'), 'utf8');
+  // The temporary file's name is taken by a folder: the write fails.
+  fs.mkdirSync(path.join(dir, 'warnings.json.tmp'));
+  svc.apply(
+    'nws-marine',
+    [
+      zoneDraft('nws:1', [zonePolygon(-150, 60)]),
+      zoneDraft('nws:2', [zonePolygon(-140, 58)]),
+    ],
+    opts,
+  );
+  svc.stop();
+  assert.match(logs.join('\n'), /could not save warnings/);
+  assert.equal(
+    fs.readFileSync(path.join(dir, 'warnings.json'), 'utf8'),
+    good,
+    'the last good file is untouched',
+  );
+  fs.rmdirSync(path.join(dir, 'warnings.json.tmp'));
+  svc.stop(); // nothing new since, but the failed save is owed
+  assert.deepEqual(
+    readSaved(dir)
+      .records.map((r) => r.id)
+      .sort(),
+    ['nws:1', 'nws:2'],
+  );
+});
+
+test('an unreadable saved file is reported, and the service starts empty', () => {
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, 'warnings.json'), '{"version":2,"rec');
+  const logs = [];
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: (m) => logs.push(m),
+  });
+  assert.equal(svc.list().length, 0);
+  assert.match(logs.join('\n'), /could not read saved warnings/);
+  const quiet = [];
+  createWarningService({ dir: tmp(), now: () => T, log: (m) => quiet.push(m) });
+  assert.deepEqual(quiet, [], 'a first run (no file) is not an error');
+});

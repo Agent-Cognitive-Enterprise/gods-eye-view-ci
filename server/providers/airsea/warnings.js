@@ -18,6 +18,7 @@ import {
   warningStatus,
 } from '../../../src/airsea/warnings.js';
 import { readZipTextEntries } from './zip.js';
+import { createGeometryStore } from './geometryStore.js';
 import { readResponseBytesCapped } from '../../../src/sources/httpBody.js';
 
 const USER_AGENT = 'GodsEyeView-fork/early-warning (local research instance)';
@@ -212,34 +213,90 @@ export function createWarningService({
   const records = new Map(); // id -> stored record
   const state = {}; // source id -> {last_success_at, last_attempt_at, last_error, failures, validators, count}
   const zones = new Map(); // zone id -> {geometry, fetchedAt}
+  // Outlines are shared between records (see geometryStore.js).
+  const geometries = createGeometryStore();
   let dirty = false;
   let version = 0; // bumped by every apply: list answers are cached by it
   const timers = [];
 
   try {
     const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-    for (const record of saved.records ?? []) records.set(record.id, record);
+    for (const record of saved.records ?? []) {
+      // Version 1 files carry every outline inline; version 2 files keep
+      // each shared part once, in `parts`.
+      record.geometry = geometries.decode(record.geometry, saved.parts);
+      records.set(record.id, record);
+    }
     Object.assign(state, saved.sources ?? {});
-  } catch {
+    // An older file is rewritten in the shared form at the next save.
+    if (saved.version !== 2 && records.size) dirty = true;
+  } catch (error) {
     // first run, or an unreadable file: start empty (the feeds refill it)
+    if (error?.code !== 'ENOENT')
+      log(`[airsea] could not read saved warnings: ${error?.message}`);
   }
 
+  /** Write all of `text`, however many calls the file system needs. */
+  function writeAll(fd, text) {
+    const bytes = Buffer.from(text, 'utf8');
+    let at = 0;
+    while (at < bytes.length) at += fs.writeSync(fd, bytes, at);
+  }
+
+  // Written piece by piece: the file never has to fit in one string.
   function save() {
     if (!dirty) return;
     dirty = false;
+    const tmp = `${file}.tmp`;
+    let fd = null;
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const tmp = `${file}.tmp`;
-      fs.writeFileSync(
-        tmp,
-        JSON.stringify({
-          version: 1,
-          records: [...records.values()],
-          sources: state,
-        }),
+      const used = new Set();
+      const stored = [...records.values()].map((record) => ({
+        ...record,
+        geometry: geometries.encode(record.geometry, used),
+      }));
+      fd = fs.openSync(tmp, 'w');
+      let chunk = '';
+      const write = (text) => {
+        chunk += text;
+        if (chunk.length >= 1 << 20) {
+          writeAll(fd, chunk);
+          chunk = '';
+        }
+      };
+      write(`{"version":2,"sources":${JSON.stringify(state)},"parts":{`);
+      let first = true;
+      for (const key of used) {
+        write(
+          `${first ? '' : ','}${JSON.stringify(key)}:${JSON.stringify(geometries.part(key))}`,
+        );
+        first = false;
+      }
+      write('},"records":[');
+      stored.forEach((record, i) =>
+        write(`${i ? ',' : ''}${JSON.stringify(record)}`),
       );
+      write(']}');
+      writeAll(fd, chunk);
+      fs.closeSync(fd);
+      fd = null;
       fs.renameSync(tmp, file);
+      // Parts no record uses any more (pruned warnings) are let go.
+      geometries.keepOnly(used);
     } catch (error) {
+      if (fd !== null)
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // already closed
+        }
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        // replaced by the next save
+      }
+      dirty = true; // tried again at the next save
       log(`[airsea] could not save warnings: ${error.message}`);
     }
   }
@@ -273,6 +330,8 @@ export function createWarningService({
         next.id;
       const stored = {
         ...next,
+        // The same zones recur in every update: one shared copy each.
+        geometry: geometries.intern(next.geometry),
         bounds: geometryBounds(next.geometry),
         chainId,
         firstSeenAtUtc: previous?.firstSeenAtUtc ?? iso(t),
