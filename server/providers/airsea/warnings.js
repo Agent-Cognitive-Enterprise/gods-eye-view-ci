@@ -232,8 +232,8 @@ export function createWarningService({
   let version = 0; // bumped by every apply: list answers are cached by it
   const timers = [];
   // A saved file that exists but could not be read is never written over:
-  // saving pauses until it reads (tried again at every save) or the server
-  // restarts, and the pause is logged hourly and shown in sources().
+  // the service waits, empty, until it reads (see load()); the wait is
+  // logged hourly and shown in sources().
   let blockedSource = null;
   let blockedReason = null;
   let lastSaveFailure = { message: null, at: -Infinity };
@@ -294,27 +294,27 @@ export function createWarningService({
           return { error: new Error('not a warnings file'), damaged: true };
         return { saved };
       } catch (error) {
+        // Never readable as it is: bad JSON, past the longest string or
+        // the largest file Node reads whole, or a folder in its place.
         const damaged =
-          error instanceof SyntaxError || error?.code === 'ERR_STRING_TOO_LONG';
+          error instanceof SyntaxError ||
+          ['ERR_STRING_TOO_LONG', 'ERR_FS_FILE_TOO_LARGE', 'EISDIR'].includes(
+            error?.code,
+          );
         if (damaged || attempt >= retries) return { error, damaged };
         pause(250 * 2 ** attempt);
       }
     }
   }
 
-  /**
-   * Records from a saved file. With `keepCurrent`, records already held
-   * (newer than the file) stay as they are; only missing ones are added.
-   */
-  function ingest(saved, { keepCurrent = false } = {}) {
-    let added = 0;
+  /** Records and source state from a saved file, into an empty store. */
+  function ingest(saved) {
     let skipped = 0;
     let outlinesLost = 0;
     for (const record of Array.isArray(saved.records) ? saved.records : []) {
       // One bad record is skipped; it never costs the rest of the file.
       try {
         if (!record?.id) throw new Error('no id');
-        if (keepCurrent && records.has(record.id)) continue;
         const had = record.geometry != null;
         // Version 1 carries every outline inline; version 2 keeps each
         // shared part once, in `parts`.
@@ -327,25 +327,25 @@ export function createWarningService({
           outlinesLost += 1;
         }
         records.set(record.id, record);
-        added += 1;
       } catch {
         skipped += 1;
       }
     }
     if (saved.sources && typeof saved.sources === 'object')
-      for (const [id, s] of Object.entries(saved.sources))
-        if (!keepCurrent || !(id in state)) state[id] = s;
+      Object.assign(state, saved.sources);
     if (skipped || outlinesLost)
       log(
         `[airsea] saved warnings: ${skipped} unreadable record(s) skipped, ${outlinesLost} outline(s) missing`,
       );
-    return added;
   }
 
   /** Handle a file that did not read; true when loading may go on. */
-  function unreadable(source, { error, damaged }) {
+  function unreadable(source, { error, damaged }, quiet) {
     const name = path.basename(source);
-    log(`[airsea] could not read saved warnings (${name}): ${error?.message}`);
+    if (!quiet || damaged)
+      log(
+        `[airsea] could not read saved warnings (${name}): ${error?.message}`,
+      );
     if (damaged && source === file)
       try {
         // Kept for the operator rather than overwritten by the next save.
@@ -357,45 +357,41 @@ export function createWarningService({
     else if (damaged) return true; // the older form: simply not used
     blockedSource = source;
     blockedReason = `${name} could not be read (${error?.message})`;
-    log(
-      `[airsea] ${name} is left as it is; warnings are not saved until it can be read`,
-    );
     return false;
   }
 
-  function load() {
+  /**
+   * Load the saved store. While a saved file exists but cannot be read, the
+   * store stays empty and the feeds are not polled: nothing gathered
+   * meanwhile could disagree with the file, and nothing writes over it.
+   * Every scheduled poll tries the whole load again, quietly and without
+   * waiting; once it loads, polling goes on from it as after a start.
+   */
+  function load({ retries = readRetries, quiet = false } = {}) {
+    const wasBlocked = blockedSource !== null;
+    blockedSource = null;
+    blockedReason = null;
     for (const source of candidates()) {
-      const result = readSaved(source);
+      const result = readSaved(source, retries);
       if (result.saved) {
         ingest(result.saved);
         // The older form is written out in the shared form at the next save.
         if (source === legacyFile && records.size) dirty = true;
-        return;
+        break;
       }
-      if (!unreadable(source, result)) return;
+      if (!unreadable(source, result, quiet)) break;
     }
-    // nothing to read: a first run, or only damaged files; the feeds refill it
+    if (blockedSource && !quiet)
+      log(
+        `[airsea] ${path.basename(blockedSource)} is left as it is; warnings are not polled or saved until it can be read`,
+      );
+    else if (wasBlocked) {
+      version += 1;
+      log(`[airsea] saved warnings could be read again; polling resumes`);
+    }
+    // otherwise: loaded, a first run, or only damaged files (the feeds refill it)
   }
   load();
-
-  /** Try the held file again; true when saving may go on. */
-  function retryBlocked() {
-    const source = blockedSource;
-    const result = readSaved(source, 0);
-    if (result.saved) {
-      blockedSource = null;
-      blockedReason = null;
-      const added = ingest(result.saved, { keepCurrent: true });
-      log(
-        `[airsea] ${path.basename(source)} could be read again: ${added} saved warning(s) added; saving resumes`,
-      );
-      return true;
-    }
-    if (!result.damaged) return false;
-    blockedSource = null;
-    blockedReason = null;
-    return unreadable(source, result);
-  }
 
   /** Write all of `bytes`, however many calls the file system needs. */
   function writeAll(fd, bytes) {
@@ -407,25 +403,21 @@ export function createWarningService({
     }
   }
 
-  /** One line per kind of failure, and again at most hourly while it lasts. */
-  function saveFailed(message) {
+  /** A line logged once, then at most hourly while it stays the same. */
+  function logHourly(line) {
     const t = now();
-    if (
-      message === lastSaveFailure.message &&
-      t - lastSaveFailure.at < 3600_000
-    )
+    if (line === lastSaveFailure.message && t - lastSaveFailure.at < 3600_000)
       return;
-    lastSaveFailure = { message, at: t };
-    log(`[airsea] could not save warnings: ${message}`);
+    lastSaveFailure = { message: line, at: t };
+    log(line);
   }
+  const saveFailed = (message) =>
+    logHourly(`[airsea] could not save warnings: ${message}`);
 
   // Written piece by piece: the file never has to fit in one string.
   function save() {
-    if (!dirty) return;
-    if (blockedSource && !retryBlocked()) {
-      saveFailed(`saves paused: ${blockedReason}`);
-      return; // still owed
-    }
+    // Nothing is written over a saved file that could not be read.
+    if (!dirty || blockedSource) return;
     dirty = false;
     const tmp = `${file}.tmp`;
     let fd = null;
@@ -763,6 +755,11 @@ export function createWarningService({
   };
 
   async function pollSource(id) {
+    if (blockedSource) load({ retries: 0, quiet: true });
+    if (blockedSource) {
+      logHourly(`[airsea] warnings not polled or saved: ${blockedReason}`);
+      return;
+    }
     const connector = connectors[id];
     const s = (state[id] ??= { failures: 0 });
     s.last_attempt_at = now();
@@ -866,7 +863,7 @@ export function createWarningService({
         ...source,
         ...sourceStatus(source),
         last_success_at: state[source.id]?.last_success_at ?? null,
-        // Why warnings are not being saved, or null.
+        // Why warnings are not being polled or saved, or null.
         saving_paused: blockedReason,
         warnings: [...records.values()].filter((r) => r.sourceId === source.id)
           .length,

@@ -801,60 +801,173 @@ test('a warnings.json written after the shared file (a rollback) is the one read
   );
 });
 
-test('a saved file another program holds is retried, never written over, and read once it frees', () => {
+// A feed answering one NWS alert, counting its calls.
+const oneAlertFeed = (calls) => async () => {
+  calls.n += 1;
+  return new Response(
+    JSON.stringify({
+      type: 'FeatureCollection',
+      features: [
+        {
+          id: 'https://api.weather.gov/alerts/x1',
+          geometry: { type: 'Point', coordinates: [-160, 64] },
+          properties: {
+            id: 'x1',
+            event: 'Gale Warning',
+            areaDesc: 'Somewhere',
+            onset: '2026-10-30T10:00:00Z',
+            ends: '2026-10-31T10:00:00Z',
+            affectedZones: [],
+          },
+        },
+      ],
+    }),
+    { status: 200 },
+  );
+};
+const busy = () =>
+  Object.assign(new Error('resource busy or locked'), { code: 'EBUSY' });
+
+test('while the saved file is held, nothing is polled or written; once it frees, polling goes on from it', async () => {
   const dir = tmp();
-  const first = createWarningService({ dir, now: () => T, log: () => {} });
+  let clock = T;
+  const first = createWarningService({ dir, now: () => clock, log: () => {} });
+  first.apply(
+    'nws-marine',
+    [
+      zoneDraft('nws:saved', [zonePolygon(-150, 60)]),
+      zoneDraft('nws:ended', [zonePolygon(-140, 58)]),
+    ],
+    OPTS,
+  );
+  first.apply('nws-marine', [zoneDraft('nws:saved', [zonePolygon(-150, 60)])], OPTS);
   first.apply('nws-marine', [zoneDraft('nws:saved', [zonePolygon(-150, 60)])], OPTS);
   first.stop();
   const savedText = fs.readFileSync(path.join(dir, STORE), 'utf8');
+  const firstSeen = first.detail('nws:saved').firstSeenAtUtc;
+
   let held = true;
   let reads = 0;
+  const calls = { n: 0 };
   const logs = [];
+  clock += 3600_000;
   const svc = createWarningService({
     dir,
-    now: () => T,
+    now: () => clock,
     log: (m) => logs.push(m),
+    fetchImpl: oneAlertFeed(calls),
     readRetries: 2,
     readFile: (f) => {
       reads += 1;
-      if (held)
-        throw Object.assign(new Error('resource busy or locked'), {
-          code: 'EBUSY',
-        });
+      if (held) throw busy();
       return fs.readFileSync(f, 'utf8');
     },
   });
-  assert.equal(reads, 3, 'read once, then twice more');
+  assert.equal(reads, 3, 'read at start, then twice more');
+  await svc.pollSource('nws-marine');
+  clock += 10 * 60_000;
+  await svc.pollSource('nws-marine');
+  assert.equal(calls.n, 0, 'the feed is not polled');
   assert.equal(svc.list().length, 0);
-  svc.apply('nws-marine', [zoneDraft('nws:new', [zonePolygon(-140, 58)])], OPTS);
   svc.stop();
+  assert.equal(fs.readFileSync(path.join(dir, STORE), 'utf8'), savedText);
   assert.equal(
-    fs.readFileSync(path.join(dir, STORE), 'utf8'),
-    savedText,
-    'the held file is not written over',
+    logs.filter((m) => /warnings not polled or saved:/.test(m)).length,
+    1,
+    'said once, not at every poll',
   );
-  assert.match(logs.join('\n'), /saves paused: warnings\.v2\.json could not be read/);
   assert.match(
     svc.sources().find((s) => s.id === 'nws-marine').saving_paused,
     /could not be read/,
   );
-  // The other program lets go: the next save reads it, keeps what arrived
-  // meanwhile, and saves both.
+
   held = false;
-  svc.stop();
-  assert.deepEqual(
-    svc
-      .list()
-      .map((w) => w.id)
-      .sort(),
-    ['nws:new', 'nws:saved'],
+  const versionBefore = svc.version();
+  clock += 10 * 60_000;
+  await svc.pollSource('nws-marine');
+  assert.equal(calls.n, 1, 'polled once the store loaded');
+  assert.ok(svc.version() > versionBefore);
+  assert.match(logs.join('\n'), /polling resumes/);
+  assert.equal(
+    svc.sources().find((s) => s.id === 'nws-marine').saving_paused,
+    null,
   );
-  assert.equal(svc.sources().find((s) => s.id === 'nws-marine').saving_paused, null);
+  // The saved warnings come back as they were, before the feed is applied.
+  assert.equal(svc.detail('nws:saved').firstSeenAtUtc, firstSeen);
+  assert.equal(svc.detail('nws:ended').endReason, 'removed_by_source');
+  assert.ok(svc.detail('nws:x1'));
   assert.deepEqual(
     readSaved(dir)
       .records.map((r) => r.id)
       .sort(),
-    ['nws:new', 'nws:saved'],
+    ['nws:ended', 'nws:saved', 'nws:x1'],
+  );
+});
+
+test('a held file that is then removed lets polling start', async () => {
+  const dir = tmp();
+  const first = createWarningService({ dir, now: () => T, log: () => {} });
+  first.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
+  first.stop();
+  let held = true;
+  const calls = { n: 0 };
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: () => {},
+    fetchImpl: oneAlertFeed(calls),
+    readRetries: 0,
+    readFile: (f) => {
+      if (held) throw busy();
+      return fs.readFileSync(f, 'utf8');
+    },
+  });
+  await svc.pollSource('nws-marine');
+  assert.equal(calls.n, 0);
+  fs.rmSync(path.join(dir, STORE));
+  held = false;
+  await svc.pollSource('nws-marine');
+  assert.equal(calls.n, 1);
+  assert.deepEqual(
+    readSaved(dir).records.map((r) => r.id),
+    ['nws:x1'],
+  );
+});
+
+test('a held newer warnings.json that turns out damaged falls back to the shared file', async () => {
+  const dir = tmp();
+  const first = createWarningService({ dir, now: () => T, log: () => {} });
+  first.apply(
+    'nws-marine',
+    [zoneDraft('nws:V2only', [zonePolygon(-150, 60)])],
+    OPTS,
+  );
+  first.stop();
+  fs.writeFileSync(path.join(dir, LEGACY), '{"version":1,"records":[');
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(path.join(dir, LEGACY), later, later);
+  let held = true;
+  const calls = { n: 0 };
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: () => {},
+    fetchImpl: oneAlertFeed(calls),
+    readRetries: 0,
+    readFile: (f) => {
+      if (held && f.endsWith(LEGACY)) throw busy();
+      return fs.readFileSync(f, 'utf8');
+    },
+  });
+  assert.equal(svc.list().length, 0, 'waiting on the newer file');
+  held = false;
+  await svc.pollSource('nws-marine');
+  assert.ok(svc.detail('nws:V2only'), 'the shared file was read, not lost');
+  assert.deepEqual(
+    readSaved(dir)
+      .records.map((r) => r.id)
+      .sort(),
+    ['nws:V2only', 'nws:x1'],
   );
 });
 
@@ -913,6 +1026,11 @@ test('a saved file holding no warnings object counts as damaged, not as held', (
       log: (m) => logs.push(m),
     });
     assert.match(logs.join('\n'), /not a warnings file/, text);
+    assert.equal(
+      fs.readdirSync(dir).filter((n) => n.includes('.unreadable-')).length,
+      1,
+      `${text}: set aside`,
+    );
     svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
     svc.stop();
     assert.deepEqual(

@@ -212,10 +212,11 @@ after `feature/air-sea-monitor` is merged and verified. It is off unless
   warnings and the feeds refill them (warnings that ended before the damage
   are not brought back). A file that cannot be opened (held by another
   program, or not permitted) is read again three times over about two
-  seconds. If it still cannot be read, it is left as it is and saving
-  pauses: every save first tries to read it again, and once it reads, its
-  warnings are added to those gathered meanwhile and saving resumes. While
-  paused, the log says `saves paused` once an hour and
+  seconds. If it still cannot be read, it is left as it is and the warning
+  feeds are not polled: nothing is gathered that could disagree with it and
+  nothing writes over it. Each scheduled poll tries the whole load again;
+  once it reads, polling goes on from it as after a start. While waiting,
+  the log says `warnings not polled or saved` once an hour and
   `/api/airsea/warning-sources` shows the reason in `saving_paused`.
 - **Keys:** AISStream allows one connection per key, and each instance with
   `AISSTREAM_API_KEY` opens its own. Air & Sea needs no new key.
