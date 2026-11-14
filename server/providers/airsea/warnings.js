@@ -230,13 +230,14 @@ export function createWarningService({
   const geometries = createGeometryStore();
   let dirty = false;
   let version = 0; // bumped by every apply: list answers are cached by it
-  const timers = [];
+  const timers = new Map(); // source id -> its two timers
+  let firstDelay = null; // set by start()
   // A saved file that exists but could not be read is never written over:
   // the service waits, empty, until it reads (see load()); the wait is
   // logged hourly and shown in sources().
   let blockedSource = null;
   let blockedReason = null;
-  let lastSaveFailure = { message: null, at: -Infinity };
+  const lastLogged = new Map(); // log line -> when it was last logged
 
   const modified = (f) => {
     try {
@@ -342,10 +343,11 @@ export function createWarningService({
   /** Handle a file that did not read; true when loading may go on. */
   function unreadable(source, { error, damaged }, quiet) {
     const name = path.basename(source);
-    if (!quiet || damaged)
-      log(
-        `[airsea] could not read saved warnings (${name}): ${error?.message}`,
-      );
+    const line = `[airsea] could not read saved warnings (${name}): ${error?.message}`;
+    // Retried at every poll: a damaged file is said hourly, a held one by
+    // the poll's own line.
+    if (!quiet) log(line);
+    else if (damaged) logHourly(line);
     if (damaged && source === file)
       try {
         // Kept for the operator rather than overwritten by the next save.
@@ -366,6 +368,7 @@ export function createWarningService({
    * meanwhile could disagree with the file, and nothing writes over it.
    * Every scheduled poll tries the whole load again, quietly and without
    * waiting; once it loads, polling goes on from it as after a start.
+   * True when this load ended a wait.
    */
   function load({ retries = readRetries, quiet = false } = {}) {
     const wasBlocked = blockedSource !== null;
@@ -381,15 +384,18 @@ export function createWarningService({
       }
       if (!unreadable(source, result, quiet)) break;
     }
-    if (blockedSource && !quiet)
-      log(
-        `[airsea] ${path.basename(blockedSource)} is left as it is; warnings are not polled or saved until it can be read`,
-      );
-    else if (wasBlocked) {
-      version += 1;
-      log(`[airsea] saved warnings could be read again; polling resumes`);
+    if (blockedSource) {
+      if (!quiet)
+        log(
+          `[airsea] ${path.basename(blockedSource)} is left as it is; warnings are not polled or saved until it can be read`,
+        );
+      return false;
     }
-    // otherwise: loaded, a first run, or only damaged files (the feeds refill it)
+    // Loaded, a first run, or only damaged files (the feeds refill it).
+    if (!wasBlocked) return false;
+    version += 1;
+    log(`[airsea] saved warnings could be read again; polling resumes`);
+    return true;
   }
   load();
 
@@ -403,12 +409,11 @@ export function createWarningService({
     }
   }
 
-  /** A line logged once, then at most hourly while it stays the same. */
+  /** Each line logged once, then at most hourly while it recurs. */
   function logHourly(line) {
     const t = now();
-    if (line === lastSaveFailure.message && t - lastSaveFailure.at < 3600_000)
-      return;
-    lastSaveFailure = { message: line, at: t };
+    if (t - (lastLogged.get(line) ?? -Infinity) < 3600_000) return;
+    lastLogged.set(line, t);
     log(line);
   }
   const saveFailed = (message) =>
@@ -461,7 +466,7 @@ export function createWarningService({
       fs.closeSync(fd);
       fd = null;
       fs.renameSync(tmp, file);
-      lastSaveFailure = { message: null, at: -Infinity };
+      lastLogged.clear(); // a failure after this is news again
       // Parts no record uses any more (pruned warnings) are let go.
       geometries.keepOnly(used);
     } catch (error) {
@@ -754,8 +759,32 @@ export function createWarningService({
     },
   };
 
+  /** (Re)schedule one source from its last success, as at start. */
+  function schedule(id, firstDelayMs) {
+    for (const timer of timers.get(id) ?? []) clearTimeout(timer);
+    const connector = connectors[id];
+    const due =
+      (state[id]?.last_success_at ?? 0) + connector.intervalMs - now();
+    const first = setTimeout(
+      () => void pollSource(id),
+      Math.max(firstDelayMs, Math.min(due, connector.intervalMs)),
+    );
+    const every = setInterval(() => void pollSource(id), connector.intervalMs);
+    first.unref?.();
+    every.unref?.();
+    timers.set(id, [first, every]);
+  }
+
   async function pollSource(id) {
-    if (blockedSource) load({ retries: 0, quiet: true });
+    if (blockedSource) {
+      const resumed = load({ retries: 0, quiet: true });
+      // The others were timed from an empty store: time them again from
+      // what was just loaded (this one polls now). One already due starts
+      // a second later, never at once from inside this poll.
+      if (resumed && firstDelay !== null)
+        for (const other of Object.keys(connectors))
+          if (other !== id) schedule(other, 1000);
+    }
     if (blockedSource) {
       logHourly(`[airsea] warnings not polled or saved: ${blockedReason}`);
       return;
@@ -837,24 +866,14 @@ export function createWarningService({
 
   return {
     start({ firstDelayMs = 30_000 } = {}) {
-      for (const [id, connector] of Object.entries(connectors)) {
-        const due =
-          (state[id]?.last_success_at ?? 0) + connector.intervalMs - now();
-        const first = setTimeout(
-          () => void pollSource(id),
-          Math.max(firstDelayMs, Math.min(due, connector.intervalMs)),
-        );
-        const every = setInterval(
-          () => void pollSource(id),
-          connector.intervalMs,
-        );
-        first.unref?.();
-        every.unref?.();
-        timers.push(first, every);
-      }
+      firstDelay = firstDelayMs;
+      for (const id of Object.keys(connectors)) schedule(id, firstDelayMs);
     },
     stop() {
-      for (const id of timers) clearTimeout(id);
+      for (const pair of timers.values())
+        for (const timer of pair) clearTimeout(timer);
+      timers.clear();
+      firstDelay = null;
       save();
     },
     pollSource,

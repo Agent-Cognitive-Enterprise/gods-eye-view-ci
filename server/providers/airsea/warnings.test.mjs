@@ -864,10 +864,13 @@ test('while the saved file is held, nothing is polled or written; once it frees,
     },
   });
   assert.equal(reads, 3, 'read at start, then twice more');
+  const versionWhileHeld = svc.version();
   await svc.pollSource('nws-marine');
   clock += 10 * 60_000;
   await svc.pollSource('nws-marine');
   assert.equal(calls.n, 0, 'the feed is not polled');
+  assert.equal(svc.version(), versionWhileHeld, 'nothing changed while held');
+  assert.doesNotMatch(logs.join('\n'), /polling resumes/);
   assert.equal(svc.list().length, 0);
   svc.stop();
   assert.equal(fs.readFileSync(path.join(dir, STORE), 'utf8'), savedText);
@@ -1068,4 +1071,63 @@ test('an outline lost on load says so, and a refused save is logged once an hour
   clock += 3600_000;
   again.stop();
   assert.equal(saveLines(), 2, 'and is said again an hour on');
+});
+
+test(
+  'when a held store frees, the other feeds are timed again from what it holds',
+  { timeout: 10_000 },
+  async (t) => {
+  const dir = tmp();
+  const HOUR = 3600_000;
+  // Saved: the 12-hourly S-124 trial last succeeded 11 hours ago.
+  fs.writeFileSync(
+    path.join(dir, STORE),
+    JSON.stringify({
+      version: 2,
+      sources: {
+        'nws-marine': { failures: 0, last_success_at: T - 5 * 60_000 },
+        's124-ccg-trial': { failures: 0, last_success_at: T - 11 * HOUR },
+      },
+      parts: {},
+      records: [],
+    }),
+  );
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  let held = true;
+  const urls = [];
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: () => {},
+    readRetries: 0,
+    readFile: (f) => {
+      if (held) throw busy();
+      return fs.readFileSync(f, 'utf8');
+    },
+    fetchImpl: async (url) => {
+      urls.push(String(url));
+      return new Response(null, { status: 304 });
+    },
+  });
+  const settle = () => new Promise((r) => setImmediate(r));
+  const versionWhileHeld = svc.version();
+  svc.start({ firstDelayMs: 1000 });
+  t.mock.timers.tick(1000);
+  await settle();
+  assert.equal(urls.length, 0, 'held: nothing polled');
+  assert.equal(svc.version(), versionWhileHeld, 'held: no resume claimed');
+  held = false;
+  // NWS polls again at its 10-minute tick and finds the store readable.
+  t.mock.timers.tick(10 * 60_000);
+  await settle();
+  assert.equal(urls.filter((u) => /weather\.gov/.test(u)).length, 1);
+  // S-124 is due an hour after its saved success + 12 h, not 12 h from start.
+  t.mock.timers.tick(HOUR);
+  await settle();
+  assert.equal(
+    urls.filter((u) => /ccg-gcc/.test(u)).length,
+    1,
+    'S-124 polled when due by its saved last success',
+  );
+  svc.stop();
 });
