@@ -1123,9 +1123,14 @@ test(
   const polls = (re) => urls.filter((u) => re.test(u)).length;
   assert.equal(polls(/weather\.gov/), 1);
   assert.equal(polls(/ccg-gcc/), 0, 'S-124 is not due yet');
+  // NWS, which found the store readable and was retimed, polls once per
+  // interval from here: no interval left over from before.
+  t.mock.timers.tick(10 * 60_000);
+  await settle();
+  assert.equal(polls(/weather\.gov/), 2, 'one poll per 10 minutes');
   // S-124 is due an hour after the resume (its saved success + 12 h), not
   // 12 h from start and not at once.
-  t.mock.timers.tick(HOUR - 2000);
+  t.mock.timers.tick(HOUR - 10 * 60_000 - 2000);
   await settle();
   assert.equal(polls(/ccg-gcc/), 0, 'not before it is due');
   t.mock.timers.tick(2000);

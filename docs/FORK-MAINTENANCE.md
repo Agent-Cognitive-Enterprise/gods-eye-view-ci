@@ -217,8 +217,8 @@ after `feature/air-sea-monitor` is merged and verified. It is off unless
   feeds are not polled: nothing is gathered that could disagree with it and
   nothing writes over it. Each scheduled poll tries the whole load again;
   once it reads, the feed whose poll found it readable polls at once and
-  the others are timed from their saved last success, as after a start.
-  While waiting,
+  then a full interval on; the others are timed from their saved last
+  success (one already due polls a second later). While waiting,
   the log says `warnings not polled or saved` once an hour and
   `/api/airsea/warning-sources` shows the reason in `saving_paused`.
 - **Keys:** AISStream allows one connection per key, and each instance with
