@@ -211,13 +211,14 @@ after `feature/air-sea-monitor` is merged and verified. It is off unless
   `warnings.v2.json.unreadable-<time>`; the server starts without saved
   warnings and the feeds refill them (warnings that ended before the damage
   are not brought back). A file that cannot be opened (held by another
-  program, or not permitted), or a damaged one that cannot be moved aside,
-  is read again three times over about two seconds. If it still cannot be
-  read, it is left as it is and the warning
+  program, or not permitted) is read again three times over about two
+  seconds; a damaged one that cannot be moved aside is not retried. If it
+  cannot be read, it is left as it is and the warning
   feeds are not polled: nothing is gathered that could disagree with it and
   nothing writes over it. Each scheduled poll tries the whole load again;
-  once it reads, polling goes on from it as after a start (each feed timed
-  from its saved last success). While waiting,
+  once it reads, the feed whose poll found it readable polls at once and
+  the others are timed from their saved last success, as after a start.
+  While waiting,
   the log says `warnings not polled or saved` once an hour and
   `/api/airsea/warning-sources` shows the reason in `saving_paused`.
 - **Keys:** AISStream allows one connection per key, and each instance with

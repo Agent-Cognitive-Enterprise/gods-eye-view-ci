@@ -1120,14 +1120,23 @@ test(
   // NWS polls again at its 10-minute tick and finds the store readable.
   t.mock.timers.tick(10 * 60_000);
   await settle();
-  assert.equal(urls.filter((u) => /weather\.gov/.test(u)).length, 1);
-  // S-124 is due an hour after its saved success + 12 h, not 12 h from start.
+  const polls = (re) => urls.filter((u) => re.test(u)).length;
+  assert.equal(polls(/weather\.gov/), 1);
+  assert.equal(polls(/ccg-gcc/), 0, 'S-124 is not due yet');
+  // S-124 is due an hour after the resume (its saved success + 12 h), not
+  // 12 h from start and not at once.
+  t.mock.timers.tick(HOUR - 2000);
+  await settle();
+  assert.equal(polls(/ccg-gcc/), 0, 'not before it is due');
+  t.mock.timers.tick(2000);
+  await settle();
+  assert.equal(polls(/ccg-gcc/), 1, 'polled when due by its saved success');
+  // Its next poll is a full 12 h after that one, not sooner.
+  t.mock.timers.tick(11 * HOUR);
+  await settle();
+  assert.equal(polls(/ccg-gcc/), 1, 'no second poll inside 12 h');
   t.mock.timers.tick(HOUR);
   await settle();
-  assert.equal(
-    urls.filter((u) => /ccg-gcc/.test(u)).length,
-    1,
-    'S-124 polled when due by its saved last success',
-  );
+  assert.equal(polls(/ccg-gcc/), 2);
   svc.stop();
 });

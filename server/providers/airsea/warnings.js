@@ -413,6 +413,10 @@ export function createWarningService({
   function logHourly(line) {
     const t = now();
     if (t - (lastLogged.get(line) ?? -Infinity) < 3600_000) return;
+    // Lines older than an hour would be said again anyway: let them go, so
+    // changing error texts over a long wait cannot pile up.
+    for (const [old, at] of lastLogged)
+      if (t - at >= 3600_000) lastLogged.delete(old);
     lastLogged.set(line, t);
     log(line);
   }
@@ -765,25 +769,30 @@ export function createWarningService({
     const connector = connectors[id];
     const due =
       (state[id]?.last_success_at ?? 0) + connector.intervalMs - now();
-    const first = setTimeout(
-      () => void pollSource(id),
+    // The interval starts at the first poll, so the second comes a full
+    // interval later (and the two can never fire together).
+    const pair = [];
+    pair[0] = setTimeout(
+      () => {
+        pair[1] = setInterval(() => void pollSource(id), connector.intervalMs);
+        pair[1].unref?.();
+        void pollSource(id);
+      },
       Math.max(firstDelayMs, Math.min(due, connector.intervalMs)),
     );
-    const every = setInterval(() => void pollSource(id), connector.intervalMs);
-    first.unref?.();
-    every.unref?.();
-    timers.set(id, [first, every]);
+    pair[0].unref?.();
+    timers.set(id, pair);
   }
 
   async function pollSource(id) {
     if (blockedSource) {
       const resumed = load({ retries: 0, quiet: true });
-      // The others were timed from an empty store: time them again from
-      // what was just loaded (this one polls now). One already due starts
-      // a second later, never at once from inside this poll.
+      // Every feed was timed from an empty store: time them again from what
+      // was just loaded. This one polls now, then a full interval on; one
+      // already due starts a second later, never from inside this poll.
       if (resumed && firstDelay !== null)
         for (const other of Object.keys(connectors))
-          if (other !== id) schedule(other, 1000);
+          schedule(other, other === id ? connectors[other].intervalMs : 1000);
     }
     if (blockedSource) {
       logHourly(`[airsea] warnings not polled or saved: ${blockedReason}`);
