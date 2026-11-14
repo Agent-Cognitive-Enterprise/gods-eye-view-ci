@@ -191,16 +191,25 @@ after `feature/air-sea-monitor` is merged and verified. It is off unless
 - **Go back a version:** run `Deploy-GEV.ps1 -Ref <rollback commit>`; the
   rollback point is in `logs\deploy-<instance>-<time>.json`.
 - **Data:** everything lives in `.gev-cache/airsea/` (`traffic.sqlite` and its
-  `-wal` and `-shm` files, `warnings.v2.json`, `zones/`). It is safe to delete
+  `-wal` and `-shm` files, `warnings.v2.json` and perhaps an older
+  `warnings.json`, `zones/`). It is safe to delete
   while the server is stopped, but traffic history cannot be rebuilt: the
   baselines start again and comparisons need two more weeks. Events already
   ingested stay in the Autopilot store until they expire.
 - **Warning outlines:** `warnings.v2.json` keeps each zone outline once and
   every warning refers to it. A `warnings.json` beside it is the older form
-  (every outline copied into every warning; it reached 535 MB). It is read
-  only when `warnings.v2.json` is missing and never written, so code from
-  before the change still finds it after a rollback; delete it once the
-  rollback window has passed. An unreadable `warnings.v2.json` is renamed
-  `warnings.v2.json.unreadable-<time>` and the feeds refill the store.
+  (every outline copied into every warning; it reached 535 MB). This code
+  never writes it, so code from before the change still finds it after a
+  rollback; it is read only when it is newer than `warnings.v2.json` (older
+  code saved it during a rollback) or when no `warnings.v2.json*` file is
+  present. Delete it once the rollback window has passed. To empty the
+  store, stop the server and delete both files: `warnings.v2.json` alone
+  would bring the older file back.
+- **An unreadable store:** a damaged `warnings.v2.json` is renamed
+  `warnings.v2.json.unreadable-<time>`; the server starts without saved
+  warnings and the feeds refill them (warnings that ended before the damage
+  are not brought back). A file that cannot be opened at all (held by
+  another program) is read again three times; if that fails, it is left as
+  it is and nothing is saved until the next restart.
 - **Keys:** AISStream allows one connection per key, and each instance with
   `AISSTREAM_API_KEY` opens its own. Air & Sea needs no new key.

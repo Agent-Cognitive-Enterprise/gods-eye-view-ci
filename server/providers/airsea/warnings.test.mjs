@@ -630,7 +630,7 @@ test('a save that fails, or would be too large to read back, keeps the last good
     dir: small,
     now: () => T,
     log: (m) => smallLogs.push(m),
-    maxSavedChars: 20_000,
+    maxSavedBytes: 20_000,
   });
   limited.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(1, 1, 50)])], OPTS);
   limited.stop();
@@ -715,4 +715,138 @@ test('an unreadable saved file is set aside, never overwritten, and reported', (
   const quiet = [];
   createWarningService({ dir: tmp(), now: () => T, log: (m) => quiet.push(m) });
   assert.deepEqual(quiet, [], 'a first run (no file) is not an error');
+});
+
+test('once the shared form has existed, an out-of-date warnings.json is never read', () => {
+  const dir = tmp();
+  let clock = T;
+  const svc = createWarningService({ dir, now: () => clock, log: () => {} });
+  svc.apply('nws-marine', [zoneDraft('nws:OLD', [zonePolygon(-150, 60)])], OPTS);
+  svc.stop();
+  // The older form, as it stood before the warning ended.
+  const v2 = readSaved(dir);
+  fs.writeFileSync(
+    path.join(dir, LEGACY),
+    JSON.stringify({ version: 1, records: [], sources: v2.sources }),
+  );
+  const legacy = JSON.parse(fs.readFileSync(path.join(dir, LEGACY), 'utf8'));
+  legacy.records = v2.records.map((r) => ({
+    ...r,
+    geometry: { type: r.geometry.type, coordinates: r.geometry.refs.map((x) => v2.parts[x]) },
+  }));
+  fs.writeFileSync(path.join(dir, LEGACY), JSON.stringify(legacy));
+  // Make the shared file the newer of the two, then end the warning in it.
+  const later = new Date(T + 60_000);
+  svc.apply('nws-marine', [], OPTS);
+  svc.apply('nws-marine', [], OPTS);
+  assert.equal(svc.detail('nws:OLD').endReason, 'removed_by_source');
+  svc.stop();
+  fs.utimesSync(path.join(dir, LEGACY), new Date(T), new Date(T));
+  fs.utimesSync(path.join(dir, STORE), later, later);
+  // The shared file is damaged and set aside; the server stops before its
+  // first save.
+  fs.writeFileSync(path.join(dir, STORE), '{"version":2,"par');
+  fs.utimesSync(path.join(dir, STORE), later, later);
+  const logs = [];
+  const damaged = createWarningService({
+    dir,
+    now: () => clock,
+    log: (m) => logs.push(m),
+  });
+  assert.equal(damaged.list().length, 0);
+  damaged.stop();
+  const next = createWarningService({
+    dir,
+    now: () => clock,
+    log: (m) => logs.push(m),
+  });
+  assert.equal(
+    next.list({ includeEnded: true }).length,
+    0,
+    'the ended warning is not brought back from the older file',
+  );
+  assert.match(logs.join('\n'), /older warnings\.json is out of date/);
+});
+
+test('a warnings.json written after the shared file (a rollback) is the one read', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
+  svc.apply('nws-marine', [zoneDraft('nws:early', [zonePolygon(-150, 60)])], OPTS);
+  svc.stop();
+  // Older code ran for a while and saved a warning this code never saw.
+  const ring = zonePolygon(-140, 58);
+  const older = createWarningService({ dir: tmp(), now: () => T, log: () => {} });
+  older.apply(
+    'nws-marine',
+    [zoneDraft('nws:early', [zonePolygon(-150, 60)]), zoneDraft('nws:during', [ring])],
+    OPTS,
+  );
+  const records = older.list().map((w) => ({
+    ...older.detail(w.id),
+    geometry: structuredClone(w.geometry),
+  }));
+  fs.writeFileSync(
+    path.join(dir, LEGACY),
+    JSON.stringify({ version: 1, records, sources: {} }),
+  );
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(path.join(dir, LEGACY), later, later);
+  const forward = createWarningService({ dir, now: () => T, log: () => {} });
+  assert.deepEqual(
+    forward
+      .list()
+      .map((w) => w.id)
+      .sort(),
+    ['nws:during', 'nws:early'],
+  );
+});
+
+test('a saved file that cannot be opened is retried, then never written over', () => {
+  const dir = tmp();
+  // A folder where the file should be: reading fails, but not as damage.
+  fs.mkdirSync(path.join(dir, STORE));
+  const logs = [];
+  const svc = createWarningService({
+    dir,
+    now: () => T,
+    log: (m) => logs.push(m),
+    readRetries: 1,
+  });
+  svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
+  svc.stop();
+  assert.ok(fs.statSync(path.join(dir, STORE)).isDirectory(), 'left as it was');
+  assert.equal(
+    fs.readdirSync(dir).filter((n) => n.includes('unreadable')).length,
+    0,
+  );
+  assert.match(logs.join('\n'), /not saved until the server restarts/);
+});
+
+test('an outline lost on load says so, and a refused save is logged once an hour', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
+  svc.apply('nws-marine', [zoneDraft('nws:lost', [zonePolygon(-140, 58)])], OPTS);
+  svc.stop();
+  const saved = readSaved(dir);
+  saved.parts = {};
+  fs.writeFileSync(path.join(dir, STORE), JSON.stringify(saved));
+  let clock = T;
+  const logs = [];
+  const again = createWarningService({
+    dir,
+    now: () => clock,
+    log: (m) => logs.push(m),
+    maxSavedBytes: 100,
+  });
+  assert.equal(again.detail('nws:lost').geometryNotes, 'outline lost on load');
+  const saveLines = () =>
+    logs.filter((m) => /could not save warnings/.test(m)).length;
+  again.apply('nws-marine', [zoneDraft('nws:new', [zonePolygon(1, 1)])], OPTS);
+  again.stop();
+  clock += 10 * 60_000;
+  again.stop();
+  assert.equal(saveLines(), 1, 'the same failure ten minutes later is not repeated');
+  clock += 3600_000;
+  again.stop();
+  assert.equal(saveLines(), 2, 'and is said again an hour on');
 });

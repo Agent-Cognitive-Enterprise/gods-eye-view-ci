@@ -199,7 +199,8 @@ function nwsZoneId(url) {
 
 /**
  * @param {{dir: string, fetchImpl?: Function, now?: () => number,
- *   log?: Function, env?: object, maxSavedChars?: number}} options
+ *   log?: Function, env?: object, maxSavedBytes?: number,
+ *   readRetries?: number}} options
  */
 export function createWarningService({
   dir,
@@ -207,13 +208,18 @@ export function createWarningService({
   now = () => Date.now(),
   log = (...args) => console.warn(...args),
   env = process.env,
-  // Above this a saved file could no longer be read back as one string.
-  maxSavedChars = 400 * 1024 * 1024,
+  // Above this a saved file could no longer be read back: readFileSync
+  // fails past V8's longest string, which it measures in bytes.
+  maxSavedBytes = 400 * 1024 * 1024,
+  // A file another program holds for a moment (a virus scanner) is read
+  // again this many times before the service gives up on it.
+  readRetries = 3,
 }) {
   // Shared outlines go to their own file, so older code (which cannot read
   // them) never meets one: rolled back, it finds its own warnings.json as
-  // last written, which this code reads once and never writes.
-  const file = path.join(dir, 'warnings.v2.json');
+  // it last wrote it. This code reads that file, never writes it.
+  const STORE = 'warnings.v2.json';
+  const file = path.join(dir, STORE);
   const legacyFile = path.join(dir, 'warnings.json');
   const zoneDir = path.join(dir, 'zones');
   const records = new Map(); // id -> stored record
@@ -224,28 +230,80 @@ export function createWarningService({
   let dirty = false;
   let version = 0; // bumped by every apply: list answers are cached by it
   const timers = [];
+  // Set when a saved file exists but could not be read: it is never written
+  // over while this server runs (a restart reads it again).
+  let savesBlocked = false;
+  let lastSaveFailure = { message: null, at: -Infinity };
+
+  const modified = (f) => {
+    try {
+      return fs.statSync(f).mtimeMs;
+    } catch {
+      return null;
+    }
+  };
+
+  /** Which saved file to start from, or null to start empty. */
+  function chooseSource() {
+    const shared = modified(file);
+    const older = modified(legacyFile);
+    // The older form wins only when it was written after the shared one:
+    // older code ran (a rollback) and saved what it saw.
+    if (shared !== null)
+      return older !== null && older > shared ? legacyFile : file;
+    // Once the shared form has existed here (one set aside as unreadable,
+    // or a save cut short), the older file is out of date: reading it would
+    // bring back warnings that have ended since.
+    let sharedSeen = false;
+    try {
+      sharedSeen = fs.readdirSync(dir).some((n) => n.startsWith(STORE));
+    } catch {
+      // no folder yet: a first run
+    }
+    if (sharedSeen) {
+      if (older !== null)
+        log(
+          `[airsea] ${STORE} is missing; the older warnings.json is out of date and not used`,
+        );
+      return null;
+    }
+    return older !== null ? legacyFile : null;
+  }
+
+  /** The parsed file; on failure, the error and whether the file is damaged. */
+  function readSaved(source) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return { saved: JSON.parse(fs.readFileSync(source, 'utf8')) };
+      } catch (error) {
+        const damaged =
+          error instanceof SyntaxError || error?.code === 'ERR_STRING_TOO_LONG';
+        if (damaged || attempt >= readRetries) return { error, damaged };
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      }
+    }
+  }
 
   function load() {
-    const source = fs.existsSync(file)
-      ? file
-      : fs.existsSync(legacyFile)
-        ? legacyFile
-        : null;
+    const source = chooseSource();
     if (!source) return; // first run: the feeds fill it
-    let saved;
-    try {
-      saved = JSON.parse(fs.readFileSync(source, 'utf8'));
-    } catch (error) {
+    const { saved, error, damaged } = readSaved(source);
+    if (!saved) {
       log(
         `[airsea] could not read saved warnings (${path.basename(source)}): ${error?.message}`,
       );
-      // Kept aside for the operator rather than overwritten by the next save.
-      if (source === file)
+      if (!damaged) savesBlocked = true;
+      else if (source === file)
         try {
+          // Kept for the operator rather than overwritten by the next save.
           fs.renameSync(file, `${file}.unreadable-${now()}`);
         } catch {
-          // left in place; the next save replaces it
+          savesBlocked = true;
         }
+      if (savesBlocked)
+        log(
+          `[airsea] ${path.basename(source)} is left as it is; warnings are not saved until the server restarts`,
+        );
       return;
     }
     let skipped = 0;
@@ -259,9 +317,10 @@ export function createWarningService({
         // shared part once, in `parts`.
         record.geometry = geometries.decode(record.geometry, saved.parts);
         if (had && !record.geometry) {
-          // Said honestly: no outline, no box drawn from the old one.
+          // Said honestly: no outline, and no box drawn from the old one.
           record.bounds = null;
           record.geometryPrecision = 'none';
+          record.geometryNotes = 'outline lost on load';
           outlinesLost += 1;
         }
         records.set(record.id, record);
@@ -275,14 +334,13 @@ export function createWarningService({
       log(
         `[airsea] saved warnings: ${skipped} unreadable record(s) skipped, ${outlinesLost} outline(s) missing`,
       );
-    // An older file is written out in the shared form at the next save.
+    // The older form is written out in the shared form at the next save.
     if (source === legacyFile && records.size) dirty = true;
   }
   load();
 
-  /** Write all of `text`, however many calls the file system needs. */
-  function writeAll(fd, text) {
-    const bytes = Buffer.from(text, 'utf8');
+  /** Write all of `bytes`, however many calls the file system needs. */
+  function writeAll(fd, bytes) {
     let at = 0;
     while (at < bytes.length) {
       const n = fs.writeSync(fd, bytes, at);
@@ -291,9 +349,21 @@ export function createWarningService({
     }
   }
 
+  /** One line per kind of failure, and again at most hourly while it lasts. */
+  function saveFailed(message) {
+    const t = now();
+    if (
+      message === lastSaveFailure.message &&
+      t - lastSaveFailure.at < 3600_000
+    )
+      return;
+    lastSaveFailure = { message, at: t };
+    log(`[airsea] could not save warnings: ${message}`);
+  }
+
   // Written piece by piece: the file never has to fit in one string.
   function save() {
-    if (!dirty) return;
+    if (!dirty || savesBlocked) return;
     dirty = false;
     const tmp = `${file}.tmp`;
     let fd = null;
@@ -306,16 +376,18 @@ export function createWarningService({
       }));
       fd = fs.openSync(tmp, 'w');
       let chunk = '';
-      let written = 0;
-      const write = (text) => {
-        written += text.length;
-        if (written > maxSavedChars)
+      let size = 0;
+      const flush = () => {
+        const bytes = Buffer.from(chunk, 'utf8');
+        size += bytes.length;
+        if (size > maxSavedBytes)
           throw new Error('too large to read back; the last good file is kept');
+        writeAll(fd, bytes);
+        chunk = '';
+      };
+      const write = (text) => {
         chunk += text;
-        if (chunk.length >= 1 << 20) {
-          writeAll(fd, chunk);
-          chunk = '';
-        }
+        if (chunk.length >= 1 << 20) flush();
       };
       write(`{"version":2,"sources":${JSON.stringify(state)},"parts":{`);
       let first = true;
@@ -330,11 +402,12 @@ export function createWarningService({
         write(`${i ? ',' : ''}${JSON.stringify(record)}`),
       );
       write(']}');
-      writeAll(fd, chunk);
+      flush();
       fs.fsyncSync(fd); // on disk before it replaces the last good file
       fs.closeSync(fd);
       fd = null;
       fs.renameSync(tmp, file);
+      lastSaveFailure = { message: null, at: -Infinity };
       // Parts no record uses any more (pruned warnings) are let go.
       geometries.keepOnly(used);
     } catch (error) {
@@ -350,7 +423,7 @@ export function createWarningService({
         // replaced by the next save
       }
       dirty = true; // tried again at the next save
-      log(`[airsea] could not save warnings: ${error.message}`);
+      saveFailed(error.message);
     }
   }
 
