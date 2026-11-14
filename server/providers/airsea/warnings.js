@@ -200,7 +200,7 @@ function nwsZoneId(url) {
 /**
  * @param {{dir: string, fetchImpl?: Function, now?: () => number,
  *   log?: Function, env?: object, maxSavedBytes?: number,
- *   readRetries?: number}} options
+ *   readRetries?: number, readFile?: (file: string) => string}} options
  */
 export function createWarningService({
   dir,
@@ -212,8 +212,9 @@ export function createWarningService({
   // fails past V8's longest string, which it measures in bytes.
   maxSavedBytes = 400 * 1024 * 1024,
   // A file another program holds for a moment (a virus scanner) is read
-  // again this many times before the service gives up on it.
+  // again this many times, waiting longer each time, before saving pauses.
   readRetries = 3,
+  readFile = (f) => fs.readFileSync(f, 'utf8'),
 }) {
   // Shared outlines go to their own file, so older code (which cannot read
   // them) never meets one: rolled back, it finds its own warnings.json as
@@ -230,9 +231,11 @@ export function createWarningService({
   let dirty = false;
   let version = 0; // bumped by every apply: list answers are cached by it
   const timers = [];
-  // Set when a saved file exists but could not be read: it is never written
-  // over while this server runs (a restart reads it again).
-  let savesBlocked = false;
+  // A saved file that exists but could not be read is never written over:
+  // saving pauses until it reads (tried again at every save) or the server
+  // restarts, and the pause is logged hourly and shown in sources().
+  let blockedSource = null;
+  let blockedReason = null;
   let lastSaveFailure = { message: null, at: -Infinity };
 
   const modified = (f) => {
@@ -243,75 +246,75 @@ export function createWarningService({
     }
   };
 
-  /** Which saved file to start from, or null to start empty. */
-  function chooseSource() {
+  /**
+   * The saved files to try, best first; none to start empty. The older form
+   * comes first only when it was written after the shared one (older code
+   * ran during a rollback and saved what it saw); if it is then damaged,
+   * the shared file is next.
+   */
+  function candidates() {
     const shared = modified(file);
     const older = modified(legacyFile);
-    // The older form wins only when it was written after the shared one:
-    // older code ran (a rollback) and saved what it saw.
     if (shared !== null)
-      return older !== null && older > shared ? legacyFile : file;
-    // Once the shared form has existed here (one set aside as unreadable,
-    // or a save cut short), the older file is out of date: reading it would
-    // bring back warnings that have ended since.
-    let sharedSeen = false;
+      return older !== null && older > shared ? [legacyFile, file] : [file];
+    // A shared file that was set aside as unreadable means the older file is
+    // out of date: reading it would bring back warnings that have ended
+    // since. (A leftover .tmp proves nothing: that save never finished.)
+    let setAside = false;
     try {
-      sharedSeen = fs.readdirSync(dir).some((n) => n.startsWith(STORE));
+      setAside = fs
+        .readdirSync(dir)
+        .some((n) => n.startsWith(`${STORE}.unreadable-`));
     } catch {
       // no folder yet: a first run
     }
-    if (sharedSeen) {
+    if (setAside) {
       if (older !== null)
         log(
-          `[airsea] ${STORE} is missing; the older warnings.json is out of date and not used`,
+          `[airsea] ${STORE} was set aside as unreadable; the older warnings.json is out of date and not used`,
         );
-      return null;
+      return [];
     }
-    return older !== null ? legacyFile : null;
+    return older !== null ? [legacyFile] : [];
   }
 
-  /** The parsed file; on failure, the error and whether the file is damaged. */
-  function readSaved(source) {
+  const pause = (ms) =>
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+  /**
+   * {saved} or {error, damaged}. Damaged is a file that will never read
+   * (bad JSON, too long, not a warnings file); anything else (a file held
+   * by another program) is read again, waiting longer each time.
+   */
+  function readSaved(source, retries = readRetries) {
     for (let attempt = 0; ; attempt++) {
       try {
-        return { saved: JSON.parse(fs.readFileSync(source, 'utf8')) };
+        const saved = JSON.parse(readFile(source));
+        if (!saved || typeof saved !== 'object' || Array.isArray(saved))
+          return { error: new Error('not a warnings file'), damaged: true };
+        return { saved };
       } catch (error) {
         const damaged =
           error instanceof SyntaxError || error?.code === 'ERR_STRING_TOO_LONG';
-        if (damaged || attempt >= readRetries) return { error, damaged };
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+        if (damaged || attempt >= retries) return { error, damaged };
+        pause(250 * 2 ** attempt);
       }
     }
   }
 
-  function load() {
-    const source = chooseSource();
-    if (!source) return; // first run: the feeds fill it
-    const { saved, error, damaged } = readSaved(source);
-    if (!saved) {
-      log(
-        `[airsea] could not read saved warnings (${path.basename(source)}): ${error?.message}`,
-      );
-      if (!damaged) savesBlocked = true;
-      else if (source === file)
-        try {
-          // Kept for the operator rather than overwritten by the next save.
-          fs.renameSync(file, `${file}.unreadable-${now()}`);
-        } catch {
-          savesBlocked = true;
-        }
-      if (savesBlocked)
-        log(
-          `[airsea] ${path.basename(source)} is left as it is; warnings are not saved until the server restarts`,
-        );
-      return;
-    }
+  /**
+   * Records from a saved file. With `keepCurrent`, records already held
+   * (newer than the file) stay as they are; only missing ones are added.
+   */
+  function ingest(saved, { keepCurrent = false } = {}) {
+    let added = 0;
     let skipped = 0;
     let outlinesLost = 0;
-    for (const record of Array.isArray(saved?.records) ? saved.records : []) {
+    for (const record of Array.isArray(saved.records) ? saved.records : []) {
       // One bad record is skipped; it never costs the rest of the file.
       try {
         if (!record?.id) throw new Error('no id');
+        if (keepCurrent && records.has(record.id)) continue;
         const had = record.geometry != null;
         // Version 1 carries every outline inline; version 2 keeps each
         // shared part once, in `parts`.
@@ -324,20 +327,75 @@ export function createWarningService({
           outlinesLost += 1;
         }
         records.set(record.id, record);
+        added += 1;
       } catch {
         skipped += 1;
       }
     }
-    if (saved?.sources && typeof saved.sources === 'object')
-      Object.assign(state, saved.sources);
+    if (saved.sources && typeof saved.sources === 'object')
+      for (const [id, s] of Object.entries(saved.sources))
+        if (!keepCurrent || !(id in state)) state[id] = s;
     if (skipped || outlinesLost)
       log(
         `[airsea] saved warnings: ${skipped} unreadable record(s) skipped, ${outlinesLost} outline(s) missing`,
       );
-    // The older form is written out in the shared form at the next save.
-    if (source === legacyFile && records.size) dirty = true;
+    return added;
+  }
+
+  /** Handle a file that did not read; true when loading may go on. */
+  function unreadable(source, { error, damaged }) {
+    const name = path.basename(source);
+    log(`[airsea] could not read saved warnings (${name}): ${error?.message}`);
+    if (damaged && source === file)
+      try {
+        // Kept for the operator rather than overwritten by the next save.
+        fs.renameSync(file, `${file}.unreadable-${now()}`);
+        return true;
+      } catch {
+        // cannot be moved: treated as held
+      }
+    else if (damaged) return true; // the older form: simply not used
+    blockedSource = source;
+    blockedReason = `${name} could not be read (${error?.message})`;
+    log(
+      `[airsea] ${name} is left as it is; warnings are not saved until it can be read`,
+    );
+    return false;
+  }
+
+  function load() {
+    for (const source of candidates()) {
+      const result = readSaved(source);
+      if (result.saved) {
+        ingest(result.saved);
+        // The older form is written out in the shared form at the next save.
+        if (source === legacyFile && records.size) dirty = true;
+        return;
+      }
+      if (!unreadable(source, result)) return;
+    }
+    // nothing to read: a first run, or only damaged files; the feeds refill it
   }
   load();
+
+  /** Try the held file again; true when saving may go on. */
+  function retryBlocked() {
+    const source = blockedSource;
+    const result = readSaved(source, 0);
+    if (result.saved) {
+      blockedSource = null;
+      blockedReason = null;
+      const added = ingest(result.saved, { keepCurrent: true });
+      log(
+        `[airsea] ${path.basename(source)} could be read again: ${added} saved warning(s) added; saving resumes`,
+      );
+      return true;
+    }
+    if (!result.damaged) return false;
+    blockedSource = null;
+    blockedReason = null;
+    return unreadable(source, result);
+  }
 
   /** Write all of `bytes`, however many calls the file system needs. */
   function writeAll(fd, bytes) {
@@ -363,7 +421,11 @@ export function createWarningService({
 
   // Written piece by piece: the file never has to fit in one string.
   function save() {
-    if (!dirty || savesBlocked) return;
+    if (!dirty) return;
+    if (blockedSource && !retryBlocked()) {
+      saveFailed(`saves paused: ${blockedReason}`);
+      return; // still owed
+    }
     dirty = false;
     const tmp = `${file}.tmp`;
     let fd = null;
@@ -804,6 +866,8 @@ export function createWarningService({
         ...source,
         ...sourceStatus(source),
         last_success_at: state[source.id]?.last_success_at ?? null,
+        // Why warnings are not being saved, or null.
+        saving_paused: blockedReason,
         warnings: [...records.values()].filter((r) => r.sourceId === source.id)
           .length,
       }));

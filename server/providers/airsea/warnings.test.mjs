@@ -801,25 +801,126 @@ test('a warnings.json written after the shared file (a rollback) is the one read
   );
 });
 
-test('a saved file that cannot be opened is retried, then never written over', () => {
+test('a saved file another program holds is retried, never written over, and read once it frees', () => {
   const dir = tmp();
-  // A folder where the file should be: reading fails, but not as damage.
-  fs.mkdirSync(path.join(dir, STORE));
+  const first = createWarningService({ dir, now: () => T, log: () => {} });
+  first.apply('nws-marine', [zoneDraft('nws:saved', [zonePolygon(-150, 60)])], OPTS);
+  first.stop();
+  const savedText = fs.readFileSync(path.join(dir, STORE), 'utf8');
+  let held = true;
+  let reads = 0;
   const logs = [];
   const svc = createWarningService({
     dir,
     now: () => T,
     log: (m) => logs.push(m),
-    readRetries: 1,
+    readRetries: 2,
+    readFile: (f) => {
+      reads += 1;
+      if (held)
+        throw Object.assign(new Error('resource busy or locked'), {
+          code: 'EBUSY',
+        });
+      return fs.readFileSync(f, 'utf8');
+    },
   });
+  assert.equal(reads, 3, 'read once, then twice more');
+  assert.equal(svc.list().length, 0);
+  svc.apply('nws-marine', [zoneDraft('nws:new', [zonePolygon(-140, 58)])], OPTS);
+  svc.stop();
+  assert.equal(
+    fs.readFileSync(path.join(dir, STORE), 'utf8'),
+    savedText,
+    'the held file is not written over',
+  );
+  assert.match(logs.join('\n'), /saves paused: warnings\.v2\.json could not be read/);
+  assert.match(
+    svc.sources().find((s) => s.id === 'nws-marine').saving_paused,
+    /could not be read/,
+  );
+  // The other program lets go: the next save reads it, keeps what arrived
+  // meanwhile, and saves both.
+  held = false;
+  svc.stop();
+  assert.deepEqual(
+    svc
+      .list()
+      .map((w) => w.id)
+      .sort(),
+    ['nws:new', 'nws:saved'],
+  );
+  assert.equal(svc.sources().find((s) => s.id === 'nws-marine').saving_paused, null);
+  assert.deepEqual(
+    readSaved(dir)
+      .records.map((r) => r.id)
+      .sort(),
+    ['nws:new', 'nws:saved'],
+  );
+});
+
+test('a leftover temporary file from a save cut short does not hide the older file', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
+  svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
+  const records = svc.list().map((w) => ({
+    ...svc.detail(w.id),
+    geometry: structuredClone(w.geometry),
+  }));
+  const fresh = tmp();
+  fs.writeFileSync(
+    path.join(fresh, LEGACY),
+    JSON.stringify({ version: 1, records, sources: {} }),
+  );
+  fs.writeFileSync(path.join(fresh, `${STORE}.tmp`), '{"version":2,"sou');
+  const again = createWarningService({ dir: fresh, now: () => T, log: () => {} });
+  assert.deepEqual(
+    again.list().map((w) => w.id),
+    ['nws:1'],
+  );
+});
+
+test('a damaged warnings.json newer than the shared file falls back to the shared file', () => {
+  const dir = tmp();
+  const svc = createWarningService({ dir, now: () => T, log: () => {} });
   svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
   svc.stop();
-  assert.ok(fs.statSync(path.join(dir, STORE)).isDirectory(), 'left as it was');
-  assert.equal(
-    fs.readdirSync(dir).filter((n) => n.includes('unreadable')).length,
-    0,
+  const good = fs.readFileSync(path.join(dir, STORE), 'utf8');
+  fs.writeFileSync(path.join(dir, LEGACY), '\u0000\u0000\u0000');
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(path.join(dir, LEGACY), later, later);
+  const logs = [];
+  const again = createWarningService({
+    dir,
+    now: () => T,
+    log: (m) => logs.push(m),
+  });
+  assert.deepEqual(
+    again.list().map((w) => w.id),
+    ['nws:1'],
   );
-  assert.match(logs.join('\n'), /not saved until the server restarts/);
+  assert.match(logs.join('\n'), /could not read saved warnings \(warnings\.json\)/);
+  assert.equal(fs.readFileSync(path.join(dir, STORE), 'utf8'), good);
+});
+
+test('a saved file holding no warnings object counts as damaged, not as held', () => {
+  for (const text of ['null', '0', 'false', '[]']) {
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, STORE), text);
+    const logs = [];
+    const svc = createWarningService({
+      dir,
+      now: () => T,
+      log: (m) => logs.push(m),
+    });
+    assert.match(logs.join('\n'), /not a warnings file/, text);
+    svc.apply('nws-marine', [zoneDraft('nws:1', [zonePolygon(-150, 60)])], OPTS);
+    svc.stop();
+    assert.deepEqual(
+      readSaved(dir).records.map((r) => r.id),
+      ['nws:1'],
+      `${text}: set aside and saving goes on`,
+    );
+  }
 });
 
 test('an outline lost on load says so, and a refused save is logged once an hour', () => {
