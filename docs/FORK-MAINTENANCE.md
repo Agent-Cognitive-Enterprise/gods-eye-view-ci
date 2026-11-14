@@ -191,9 +191,16 @@ after `feature/air-sea-monitor` is merged and verified. It is off unless
 - **Go back a version:** run `Deploy-GEV.ps1 -Ref <rollback commit>`; the
   rollback point is in `logs\deploy-<instance>-<time>.json`.
 - **Data:** everything lives in `.gev-cache/airsea/` (`traffic.sqlite` and its
-  `-wal` and `-shm` files, `warnings.json`, `zones/`). It is safe to delete
+  `-wal` and `-shm` files, `warnings.v2.json`, `zones/`). It is safe to delete
   while the server is stopped, but traffic history cannot be rebuilt: the
   baselines start again and comparisons need two more weeks. Events already
   ingested stay in the Autopilot store until they expire.
+- **Warning outlines:** `warnings.v2.json` keeps each zone outline once and
+  every warning refers to it. A `warnings.json` beside it is the older form
+  (every outline copied into every warning; it reached 535 MB). It is read
+  only when `warnings.v2.json` is missing and never written, so code from
+  before the change still finds it after a rollback; delete it once the
+  rollback window has passed. An unreadable `warnings.v2.json` is renamed
+  `warnings.v2.json.unreadable-<time>` and the feeds refill the store.
 - **Keys:** AISStream allows one connection per key, and each instance with
   `AISSTREAM_API_KEY` opens its own. Air & Sea needs no new key.

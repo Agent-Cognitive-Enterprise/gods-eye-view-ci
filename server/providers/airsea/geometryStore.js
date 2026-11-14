@@ -35,10 +35,11 @@ export function createGeometryStore() {
   const keys = new WeakMap(); // frozen coordinates -> key
 
   /** The one shared copy of these coordinates. */
-  function part(coordinates, key = null) {
+  function part(coordinates) {
+    if (!Array.isArray(coordinates)) throw new TypeError('not coordinates');
     const known = keys.get(coordinates);
     if (known) return coordinates;
-    const k = key ?? keyFor(coordinates);
+    const k = keyFor(coordinates);
     const existing = parts.get(k);
     if (existing) return existing;
     deepFreeze(coordinates);
@@ -99,11 +100,14 @@ export function createGeometryStore() {
    */
   function decode(stored, table) {
     if (!stored || typeof stored !== 'object') return stored ?? null;
+    // Keys on disk are not trusted: each part is hashed again, so a wrong
+    // key can never hand one outline another's coordinates. A part used
+    // by many records is the same array each time and is hashed once.
     const load = (ref) => {
-      if (typeof ref !== 'string') return null;
-      if (parts.has(ref)) return parts.get(ref);
-      const coordinates = table?.[ref];
-      return Array.isArray(coordinates) ? part(coordinates, ref) : null;
+      if (typeof ref !== 'string' || !table || !Object.hasOwn(table, ref))
+        return null;
+      const coordinates = table[ref];
+      return Array.isArray(coordinates) ? part(coordinates) : null;
     };
     switch (stored.type) {
       case 'Polygon':

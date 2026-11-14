@@ -199,7 +199,7 @@ function nwsZoneId(url) {
 
 /**
  * @param {{dir: string, fetchImpl?: Function, now?: () => number,
- *   log?: Function, env?: object}} options
+ *   log?: Function, env?: object, maxSavedChars?: number}} options
  */
 export function createWarningService({
   dir,
@@ -207,8 +207,14 @@ export function createWarningService({
   now = () => Date.now(),
   log = (...args) => console.warn(...args),
   env = process.env,
+  // Above this a saved file could no longer be read back as one string.
+  maxSavedChars = 400 * 1024 * 1024,
 }) {
-  const file = path.join(dir, 'warnings.json');
+  // Shared outlines go to their own file, so older code (which cannot read
+  // them) never meets one: rolled back, it finds its own warnings.json as
+  // last written, which this code reads once and never writes.
+  const file = path.join(dir, 'warnings.v2.json');
+  const legacyFile = path.join(dir, 'warnings.json');
   const zoneDir = path.join(dir, 'zones');
   const records = new Map(); // id -> stored record
   const state = {}; // source id -> {last_success_at, last_attempt_at, last_error, failures, validators, count}
@@ -219,28 +225,70 @@ export function createWarningService({
   let version = 0; // bumped by every apply: list answers are cached by it
   const timers = [];
 
-  try {
-    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-    for (const record of saved.records ?? []) {
-      // Version 1 files carry every outline inline; version 2 files keep
-      // each shared part once, in `parts`.
-      record.geometry = geometries.decode(record.geometry, saved.parts);
-      records.set(record.id, record);
+  function load() {
+    const source = fs.existsSync(file)
+      ? file
+      : fs.existsSync(legacyFile)
+        ? legacyFile
+        : null;
+    if (!source) return; // first run: the feeds fill it
+    let saved;
+    try {
+      saved = JSON.parse(fs.readFileSync(source, 'utf8'));
+    } catch (error) {
+      log(
+        `[airsea] could not read saved warnings (${path.basename(source)}): ${error?.message}`,
+      );
+      // Kept aside for the operator rather than overwritten by the next save.
+      if (source === file)
+        try {
+          fs.renameSync(file, `${file}.unreadable-${now()}`);
+        } catch {
+          // left in place; the next save replaces it
+        }
+      return;
     }
-    Object.assign(state, saved.sources ?? {});
-    // An older file is rewritten in the shared form at the next save.
-    if (saved.version !== 2 && records.size) dirty = true;
-  } catch (error) {
-    // first run, or an unreadable file: start empty (the feeds refill it)
-    if (error?.code !== 'ENOENT')
-      log(`[airsea] could not read saved warnings: ${error?.message}`);
+    let skipped = 0;
+    let outlinesLost = 0;
+    for (const record of Array.isArray(saved?.records) ? saved.records : []) {
+      // One bad record is skipped; it never costs the rest of the file.
+      try {
+        if (!record?.id) throw new Error('no id');
+        const had = record.geometry != null;
+        // Version 1 carries every outline inline; version 2 keeps each
+        // shared part once, in `parts`.
+        record.geometry = geometries.decode(record.geometry, saved.parts);
+        if (had && !record.geometry) {
+          // Said honestly: no outline, no box drawn from the old one.
+          record.bounds = null;
+          record.geometryPrecision = 'none';
+          outlinesLost += 1;
+        }
+        records.set(record.id, record);
+      } catch {
+        skipped += 1;
+      }
+    }
+    if (saved?.sources && typeof saved.sources === 'object')
+      Object.assign(state, saved.sources);
+    if (skipped || outlinesLost)
+      log(
+        `[airsea] saved warnings: ${skipped} unreadable record(s) skipped, ${outlinesLost} outline(s) missing`,
+      );
+    // An older file is written out in the shared form at the next save.
+    if (source === legacyFile && records.size) dirty = true;
   }
+  load();
 
   /** Write all of `text`, however many calls the file system needs. */
   function writeAll(fd, text) {
     const bytes = Buffer.from(text, 'utf8');
     let at = 0;
-    while (at < bytes.length) at += fs.writeSync(fd, bytes, at);
+    while (at < bytes.length) {
+      const n = fs.writeSync(fd, bytes, at);
+      if (n <= 0) throw new Error('the disk accepted nothing');
+      at += n;
+    }
   }
 
   // Written piece by piece: the file never has to fit in one string.
@@ -258,7 +306,11 @@ export function createWarningService({
       }));
       fd = fs.openSync(tmp, 'w');
       let chunk = '';
+      let written = 0;
       const write = (text) => {
+        written += text.length;
+        if (written > maxSavedChars)
+          throw new Error('too large to read back; the last good file is kept');
         chunk += text;
         if (chunk.length >= 1 << 20) {
           writeAll(fd, chunk);
@@ -279,6 +331,7 @@ export function createWarningService({
       );
       write(']}');
       writeAll(fd, chunk);
+      fs.fsyncSync(fd); // on disk before it replaces the last good file
       fs.closeSync(fd);
       fd = null;
       fs.renameSync(tmp, file);
@@ -712,6 +765,8 @@ export function createWarningService({
           }
         : null;
     },
+    /** Distinct outline parts held (each shared by every warning using it). */
+    storedOutlines: () => geometries.size,
     /** For tests and fixtures: apply drafts as a source would. */
     apply,
   };
